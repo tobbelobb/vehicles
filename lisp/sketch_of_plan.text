@@ -1,0 +1,264 @@
+**** Data flow and hierarchy mapping ****
+
+ type
+   tnn-index
+     The list of nodes in transparent-neural-network objects should be indexable with this type, maybe through some layer of indexing functions.
+     implementation: some kind of unsigned long
+
+ type
+   sa-ring-buffer 
+     Has a ever-incrementing head-index.
+     implementation: Use a fixed size array of sa-pair and (setf (head-index ring-buffer) (mod head-index (length ring-buffer)))
+
+ class
+   transparent-neural-network
+    slot: list of tnn-node nodes
+    slot: function         index-generator
+      The index generator is the function that gives names to new nodes of type tnn-index.
+      It carries some state to guarantee uniqueness.
+      The nodes list will grow large very fast, so maybe make it a hashtable?
+      // TODO: check how Simone solved this. torbjörn 22. may 2015
+ 
+ class
+   tnn-node
+     slot: tnn-index idx
+      // TODO: check Simones Python code and put slots into here. torbjörn 22. may 2015
+
+ class
+   a-node inherits tnn-node
+     slot: function action
+       The function in an a-node has signature: vehicle, world --> world
+
+ class
+   s-node inherits tnn-node
+     slot: boolean                  active
+     slot: boolean                  imagined-active
+     slot: list of (tnn-index real) qs
+     slot: list if tnn-index        index-generator
+       Any sensor in the tnn-network.
+       There's a special class for this since in general we don't expect to be able to remove/forget sensors
+       in a robot while concepts should be removable/forgettable.
+       The list of Q-values, qs, is structured like ((q-idx Q-value) (q-idx Q-value) ...).
+       // TODO: check Simones Python code and put slots into here. torbjörn 22. may 2015
+
+ class
+   c-node inherits s-node
+     slot: boolean active
+     slot: boolean imagined-active
+      // TODO: check Simones Python code and put slots into here. torbjörn 22. may 2015
+
+ class
+   sa-pair
+     slot: tnn-index         action-index
+     slot: list of tnn-index s
+       The actual action function is stored in the a-node object at action-index.
+
+ class
+   vehicle
+     slot: transparent-neural-network tnn
+     slot: real in [-1,1]             reward
+     slot: list of tnn-index          s
+     slot: list of tnn-index          s-prime
+     slot: sa-ring-buffer             sa-memory                  
+     slot: boolean                    action-taken
+       Here we store what would be inside a physical built robot.
+       s and s-prime are lists of indices of c-nodes in tnn that is relevant for action-planning.
+       sa-memory stores the previous states and actions. Head of the buffer is always the most recently planned action.
+       action-taken needs to be reset on each time step.
+
+ class
+   placed-vehicle inherits vehicle
+     slot: list of real  size
+     slot: list of real  position
+     slot: real          orientation
+       Here we store all we can say about a vehicle by looking at it from the outside.
+       Size could just be list of width and length to begin with.
+
+ class
+   World
+     slot: list of reals           size
+     slot: list of placed-vehicle  vehicles
+     slot: list of source          sources
+     slot: list of obstacle        obstacles
+     // TODO: Check weismanns code and sync with this
+
+ function
+   make-index-generator: --> function: --> tnn-index
+     Creates unnamed functions that can give unique names to new nodes.
+     Created function carries some state to guarantee uniqueness.
+     Created function used as slot in transparent-neural-network objects, referenced via the accessor.
+
+ function
+   step-time: World --> World
+     Steps time forward.
+     Should maybe take \delta t as a input to decide how large time step we want.
+     Uses a RL algoritm for updating TNN-networks.
+     Uses some physics engine to simulate movement.
+     Should log any changes made to networks.
+     Should log all movements of vehicles.
+
+ function
+   plan-action: list of s-nodes --> tnn-index
+     Takes nodes in state s (both s-nodes and c-nodes) and use the Q-values found there to decide which action-node to use.
+     Observe that actual nodes are sent to plan-action, not their indices.
+
+ function
+   planned-action: vehicle --> function: world, vehicle --> world
+     implementation:  accessors         tnn-index of action node 
+                     (action (get-node (elt (head (vehicle sa-memory)) (vehicle sa-memory)) (tnn vehicle)))
+
+ function
+   get-relevant-s-nodes: list of tnn-index, transparent-neural-network --> list of s-nodes
+     implementation: (mapcar #'(lambda (idx) (get-node idx (tnn vehicle))) (s vehicle))
+                       or
+                     (loop for index in (s vehicle)
+                           collect (get-node index (tnn vehicle))
+
+ function
+   reward-fun: vehicle, world --> real in [-1, 1]
+     Decides which reward the vehicle in the world is worthy of right now.
+ 
+ method
+   s-prime: vehicle        --> list of tnn-index
+   s-prime: sa-ring-buffer --> list of tnn-index
+
+ method
+   s: vehicle        --> list of tnn-index
+   s: sa-ring-buffer --> list of tnn-index
+
+ method
+   insert-in-sa-memory: sa-ring-buffer, sa-pair           --> sa-ring-buffer // inserts the pair and moves head
+   insert-in-sa-memory: sa-ring-buffer, list of tnn-index --> sa-ring-buffer // if s empty, insert, otherwise create new pair with empty a
+   insert-in-sa-memory: sa-ring-buffer, tnn-index         --> sa-ring-buffer // ditto with s and a reversed
+
+**** Learning algorithms ****
+ *** one-step Q-learning *** // This was compiled 22. may 2015 by torbjörn
+   PSEUDO:   Choose a from s using policy derived from Q
+   LISP:     (insert-in-sa-memory (sa-memory vehicle)
+                                  (make-sa-pair (s vehicle)
+                                                (plan-action (get-relevant-s-nodes (s vehicle) (tnn vehicle)))))
+   COMMENTS: The state s is a list of indicies for top active concept nodes.
+             plan-action decides wether we explore, are \epsilon-greedy or if we create new action node.
+             TODO: should plan-action create a feature vector from TNN?
+             tnn of vehicle must be sent in such that the local-action-index list of the sa-pair from plan-action can be created.
+
+   PSEUDO:   Take action a
+   LISP:     (setf World (funcall (planned-action vehicle) World vehicle))
+   COMMENTS: All consequences of action in world must be calculated with a, which is the function found in (planned-action vehicle).
+             Other vehicles plans might interfere, references to all vehicles are found in World object.
+             If vehicles plans are calculated to interfere, their new positions are all calculated at once.
+             A flag in each vehicle (setf (action-taken vehicle) T) marks that action consequences are already calculated.
+             The goal of a is to output a new world with new vehicle position(s).
+
+   PSEUDO:   Observe r and s'
+   LISP:     (setf (tnn vehicle) (observe vehicle World))
+             (setf (reward vehicle) (reward-fun vehicle World))
+             (setf (tnn vehicle) (tnn-concept-update (tnn vechicle) (reward vehicle)))
+             (setf (s-prime vehicle) (get-state (tnn vehicle)))
+   COMMENTS: observe propagates perception in TNN-network, marks concept/sensor nodes as active/attentioned/imagined.
+             reward-fun uses any information of simulation to decide how rewarded the vehicle is right now.
+             tnn-concept-update uses arousal-level to see if new concept nodes should be created, and return TNN where they are created.
+             tnn-concept-update might use reward as a sensor in TNN or it might not.
+             get-state retrieves the relevant node indices for action decision policy. Might be the top active ones, might be more/fewer.
+             // TODO: s-prime is not needed now that we have the sa-ring-buffer as memory.
+
+   PSEUDO:   Update Q(s,a) like Q(s,a) <-- Q(s,a) + \alpha*(r + \gamma*max_{a'}(Q(s',a')) - Q(s,a))
+   LISP:     (loop for concept-idx in (s vehicle)
+                   and q-idx = (this-action-index (index-mapping (planned-action vehicle)) concept-idx)
+                   and q     = (q-value q-idx (concept-node concept-idx (tnn vehicle)))
+                   and q-max = (loop for concept-prime-idx in (s-prime vehicle)
+                                     maximize (max (q-values (concept-node concept-prime-idx (tnn vehicle))))) 
+                   do (setf (q-value q-idx (concept-node concept-idx (tnn vehicle)))
+                            (+ q (* alpha (+ (reward vehicle) (* gamma q-max) -q))))
+   COMMENTS: First line says every relevant concept will learning from this experience of taking action a and recieving reward r.
+             The q-idx is needed since every concept-node has a list of Q-values. One action can be on different indices in differenc c-nodes.
+             q-value is an accessor function for single Q-values in single c-nodes.
+             concept-node access single c-nodes from a TNN network.
+             q-values accesses the complete list of Q-values from a c-node.
+             This could be made simpler with mapping functions. Especially the q-max loop should be easily replaced.
+             In Cypher we would do something like  MATCH (c_prime:Concept) -[rel_prime:ACT]- (:Action) WHERE c_prime.in_s_prime = true,
+                                                         (c:Concept) -[rel_prime:ACT]- (a:Action) WHERE c.in_s = true
+                                                   SET rel.Q += alpha*({r} + gamma*max(rel_prime.Q) - rel.Q)
+
+   PSEUDO:   s <-- s'
+   LISP:     (setf (s vehicle) (s-prime vehicle))
+ *** end one-step Q-learning ***
+
+ *** Tabular Sarsa(\lambda) ***
+ Figure 7.11 page 181 (tabular Sarsa(\lambda))
+   PSEUDO:  Take action a
+   PSEUDO:  Observe r and s'
+   PSEUDO:  Choose a' from s' using policy derived from Q
+   PSEUDO:  Temp \delta <-- r + \gamma*Q(s',a') - Q(s,a)
+   PSEUDO:  Increment e(s,a)
+   PSEUDO:  For all s, a:
+   PSEUDO:    Update Q(s,a) <-- Q(s,a) + \alpha*\delta*e(s,a)
+   PSEUDO:    Scale e(s,a) <-- \gamma*\lambda*e(s,a)
+   PSEUDO:  s <-- s'
+   PSEUDO:  a <-- a'
+ *** end Tabular Sarsa(\lambda) ***
+
+**** end Learning algorithms ****
+
+
+   Since we create new Q-variables with each new connection, we must start with an optimistic Q-value,
+   or the action will be explored very slowly.
+   Since we create new connections, we can get initial exploration from optimistic initial Q-values.
+
+     How do we choose an action when several concept nodes are top active?
+       - We could sum Q-values from all top active nodes. Greedy action maximizes this sum.
+     Should we encourage exploration by always increasing unchoosen Q-values a little? No. 
+  
+ The function Q-update
+   should take the previous TNN (with the selected action marked) and a reward as its input, and
+   update the Q-values in the top-active concepts (this is then TD(1))
+
+ The function run-simulation
+   should take an :animate key, which shows animation real time if true
+   it should also take a :save-animation key which saves a video of the simulation
+
+*** Two-step simulation model ***
+ File-model 0
+   run-simulation appends state (World object) to file in data-directory after each update
+   (write-data).
+   When simulation is done run-simulation will store current state of Simulation object in
+   re-loadable fashion in sims-directory
+   Therefore each simulation must have a name. File name in sims-directory will be
+   <name>_timestep.sim
+   TODO: What will be in Simulation object that is not in World object?
+   
+ There should be a data package
+   it should contain the functions create-data-file, write-data and read-data
+   It should be the only link between the Simulate and the Visualize part of the program
+
+ The function create-data-file
+   given a file name, it should create the file if it doesn't exist.
+   All vehicles, sources and other objects in the world should be presented at beginning of file
+   and given names.
+
+ The function read-data
+   given an open file, it should read and return a World object from it.
+
+ The function write-data
+   given an open file and a World object, it should append the object to the file the following
+   way:
+     For each vehicle in world
+       write vehicle name
+       write vehicle position
+       write vehicle direction
+       write vehicle speed
+       write vehicle TNN after updating concepts and deciding action. Concept updates and action
+         choice must be clearly visible.
+
+ There should be a visualize package
+   Visualization is supposed to take place after the simulation is run for a long time.
+   However, in development process, it is useful to be visualize temp-objects directly for
+   debugging purposes.
+ The method visualize
+   given a TNN object, it should return an image of it   (debugging)
+   given a World object, it should return an image of it (debugging)
+   given a Simulation object, it should return a video
+     TODO: This is the only use of Simulation object so far. Do we need it?
+     We could give visualize a data file name, and have it make a video of that?
+     That is, Simulation objects could be manifested only as data files.
+

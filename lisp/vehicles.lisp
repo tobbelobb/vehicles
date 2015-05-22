@@ -1,109 +1,396 @@
 ;;;; vehicles.lisp
+;;----------------------------------------------------------------------
+;; 
+;; Copyright:   Copyright (c) 1999 John Wiseman
+;; File:        vehicles.lisp
+;; Created:     18 July 1998
+;; Author:      John Wiseman (jjwiseman@gmail.com)
+;; 
+;; Description: Braitenberg vehicle simulator
+;; 
+;; Changes: Torbjørn Ludvigsen 2015
+;; 
+;;----------------------------------------------------------------------
+;;
 ;; This package describes Vehicle objects and gives means for creating and manipulating them
 (defpackage :vehicles/vehicles
   (:use :cl)
-  (:export #:test))
+  (:export #:lamp))
 
-;; *** Data flow and hierarchy mapping ***
-;; Vehicle objects will be input to World objects
-;; World objects will be input to Simulation objects
-;; TNN networks will be input to Vehicle brain slot
-;; 
-;; The function update
-;;   should take a World object as its input and return a World where one time step is taken
-;;   For all vehicles in World:
-;;     Try to execute action in world. Calculate whatever consquences.
-;;       (setf World (funcall (planned-action vehicle) World vehicle))
-;;   For all vehicles in World:
-;;     Update sensory information, store in TNN.
-;;       (setf (tnn vehicle) (percieve vehicle World))
-;;     Reward
-;;       (setf (reward vehicle) (reward-fun vehicle World))
-;;     Learn. Reward is used here only. May not need slot in vehicle object.
-;;       (setf (tnn vehicle) (update-q (tnn vehicle) (reward vehicle) (planned-action vehicle)))
-;;     Associate. Maybe create new concepts. Mark top active ones.
-;;       (setf (tnn vehicle) (propagate-perception (tnn vehicle)))
-;;     Plan next action
-;;       (setf (planned-action vehicle) (plan-action (tnn vehicle)))
-;;     Save
-;;       (write-data stream World)
-;;       
-;;     ** Learn **
-;;       - Remember previous top active nodes (state) and which action was taken. Possibly several
-;;           time steps back.
-;;       - Use current reward to update Q-values in TNN. Possibly several time steps back.
-;;     ** Associate **
-;;       - Maybe create new concepts, store in TNN.
-;;       - If new concept was created, make is top-active and children not.
-;;     ** Decide **
-;;       - Use Q-values to decide which action to take.
-;;       - Store planned next action in TNN.
-;;     
-;;     How do we choose an action when several concept nodes are top active?
-;;       - We could sum Q-values from all top active nodes. Greedy action maximizes this sum.
-;;     Should we encourage exploration by always increasing unchoosen Q-values a little?
-;;       - TODO: Check Peters old mail to see if this was so.
-;;  
-;; The function update-TNN
-;;   should take a TNN object and a reward as its input and update the TNN according to Python
-;;   program already written. All temporal information is stored in nodes, so no history-TNN needed.
-;;
-;; The function Q-update
-;;   should take the previous TNN (with the selected action marked) and a reward as its input, and
-;;   update the Q-values in the top-active concepts (this is then TD(1))
-;;
-;; The function run-simulation
-;;   should take an :animate key, which shows animation real time if true
-;;   it should also take a :save-animation key which saves a video of the simulation
-;;
-;; *** Two-step simulation model ***
-;; File-model 0
-;;   run-simulation appends state (World object) to file in data-directory after each update
-;;   (write-data).
-;;   When simulation is done run-simulation will store current state of Simulation object in
-;;   re-loadable fashion in sims-directory
-;;   Therefore each simulation must have a name. File name in sims-directory will be
-;;   <name>_timestep.sim
-;;   TODO: What will be in Simulation object that is not in World object?
-;;   
-;; There should be a data package
-;;   it should contain the functions create-data-file, write-data and read-data
-;;   It should be the only link between the Simulate and the Visualize part of the program
-;;
-;; The function create-data-file
-;;   given a file name, it should create the file if it doesn't exist.
-;;   All vehicles, sources and other objects in the world should be presented at beginning of file
-;;   and given names.
-;;
-;; The function read-data
-;;   given an open file, it should read and return a World object from it.
-;;
-;; The function write-data
-;;   given an open file and a World object, it should append the object to the file the following
-;;   way:
-;;     For each vehicle in world
-;;       write vehicle name
-;;       write vehicle position
-;;       write vehicle direction
-;;       write vehicle speed
-;;       write vehicle TNN after updating concepts and deciding action. Concept updates and action
-;;         choice must be clearly visible.
-;;
-;; There should be a visualize package
-;;   Visualization is supposed to take place after the simulation is run for a long time.
-;;   However, in development process, it is useful to be visualize temp-objects directly for
-;;   debugging purposes.
-;; The method visualize
-;;   given a TNN object, it should return an image of it   (debugging)
-;;   given a World object, it should return an image of it (debugging)
-;;   given a Simulation object, it should return a video
-;;     TODO: This is the only use of Simulation object so far. Do we need it?
-;;     We could give visualize a data file name, and have it make a video of that?
-;;     That is, Simulation objects could be manifested only as data files.
-;;
 
 (in-package :vehicles/vehicles)
 
-(defun test ()
-  (print "this is a test"))
+;; anything with a name
 
+(defclass named-object ()
+  ((name :accessor name-of :initform nil :initarg :name)
+   (world :accessor world :initform nil :initarg :world)))
+
+(defmethod print-object ((self named-object) stream)
+  (print-unreadable-object (self stream :type T :identity T)
+    (princ (name-of self) stream)))
+
+;;----------------------------------------
+;;
+;; world-node
+;;
+;; Correctly handles asynchronous updating.
+;;
+;; -- Methods
+;;
+;; OUTPUT
+;; Returns the world-node's output, only recomputing if necessary.
+;;
+;; COMPUTE-OUTPUT
+;; Forces a world-nodes output to be recomputed, and returns the result. Child
+;; classes should specialize this method.
+;;
+;;----------------------------------------
+
+;; The base world-node class.
+
+(defclass world-node (named-object)
+  ((cached-output :accessor cached-output :initform 0)
+   (cache-time    :accessor cache-time :initform -1)
+   (probes :accessor probes :initform nil)))
+
+(defmethod output ((self world-node))
+  (let ((output (cached-output self))
+        (world-time (world-time (world self))))
+    ;; only recompute what the output should be if we haven't
+    ;; computed and cached it already
+    (when (/= world-time (cache-time self))
+      (setf (cache-time self) world-time)
+      (setf (cached-output self) (compute-output self)))
+    output))
+
+(defvar *probes-active-p* T)
+
+(defmethod compute-output :around ((self world-node))
+  (let ((value (call-next-method)))
+    (when (and *probes-active-p* (probes self))
+      (dolist (probe (probes self))
+        (funcall probe self)))
+    value))
+
+;; --------------------
+;; world-node with inputs
+;; 
+;; Any world-node that accepts inputs.
+;; --------------------
+
+(defclass world-node-with-inputs (world-node)
+  ((current-inputs :accessor inputs :initform '() :initarg :inputs)
+   (original-inputs :accessor original-inputs :initform '())))
+
+
+;; Add inputs
+
+(defmethod sum-inputs ((self world-node-with-inputs))
+  (sum-world-node-values #'output (inputs self)))
+
+(defun sum-world-node-values (function world-nodes)
+  (reduce #'+ world-nodes :key function))
+
+
+
+;; --------------------
+;; Integrator
+;; 
+;; A world-node that has digital inputs and an analog output, and whose
+;; output is a running average of the input.
+;; --------------------
+
+(defclass integrator (world-node-with-inputs)
+  ((decay-factor :accessor decay-factor :initform 0.0 :initarg :decay-factor)))
+
+(defmethod compute-output ((self integrator))
+  (let ((input-sum (sum-inputs self))
+	(decay-factor (expt (decay-factor self)
+			    (/ 5.0 (world-ticks-per-second (world self))))))
+    (+ (* (min 1.0 input-sum) (- 1.0 decay-factor))
+       (* (cached-output self) decay-factor))))
+
+;; --------------------
+;; Neurode
+;; 
+;; world-nodes that act as computational elements.
+;; --------------------
+	       
+(defclass neurode (world-node-with-inputs)
+  ((threshold  :accessor threshold :initform 1 :initarg :threshold)
+   (inhibitors :accessor inhibitors :initform '() :initarg :inhibitors)))
+
+(defmethod sum-inhibitors ((self neurode))
+  (sum-world-node-values #'output (inhibitors self)))
+
+(defmethod compute-output ((self neurode))
+  (let ((input-sum (sum-inputs self))
+        (inhib-sum (sum-inhibitors self)))
+    (if (and (= inhib-sum 0) (>= input-sum (threshold self)))
+      1
+      0)))
+
+;; --------------------
+;; Radiator
+;; 
+;; A source of radiation.
+;; --------------------
+
+(defclass radiator (integrator)
+  ((radiation-type :accessor radiation-type :initarg :radiation-type :initform nil)
+   (brightness	   :accessor brightness :initarg :brightness :initform 1.0)
+   (platform	     :accessor platform :initarg :platform :initform nil)))
+
+(defmethod location ((self radiator))
+  (location (platform self)))
+
+(defmethod compute-output ((self radiator))
+  (if (and (null (inputs self))
+           (null (original-inputs self)))
+      (brightness self)
+    ;; will this work?
+    (call-next-method)))
+
+
+;; --------------------
+;; Sensor
+;; 
+;; Sensors on platforms.  Sensors take an analog input corresponding
+;; to the experienced intensity of the radiation to which they are
+;; sensitive.  They have a digital output whose rate is proportional
+;; to the radiation intensity.
+;;
+;; TODO: Sensor is not directional.
+;; --------------------
+
+(defclass sensor (world-node)
+  ((radiation-type 	 :accessor radiation-type)
+   (sensitivity		 :accessor sensitivity :initform 1.0 :initarg :sensitivity)
+   (directional?	 :accessor directional? :initform T :initarg :directional?)
+   (relative-orientation :accessor relative-orientation :initarg :relative-orientation)
+   (relative-location 	 :accessor relative-location :initarg :relative-location)
+   (platform 		 :accessor platform :initarg :platform)
+   (accumulator 	 :accessor accumulator :initform 0.0)))
+
+(defmethod compute-output ((self sensor))
+  (let ((rate (* (sensitivity self) (sum-inputs self))))
+    (let ((accum (min 1.0 (+ rate (accumulator self)))))
+      (let ((pulse (cond ((>= accum 1.0)
+			  (setq accum (- accum 1.0))
+			  1)
+			 (T 0))))
+	(setf (accumulator self) accum)
+	pulse))))
+
+;; Returns the sum of the received signal intensities.
+
+(defmethod sum-inputs ((self sensor))
+  (sum-world-node-values #'(lambda (r)
+                       (signal-strength self r))
+                   (radiators-of-type (world self) (radiation-type self))))
+    
+;; Calculates the radiation received by a sensor from a radiator.
+
+(defmethod signal-strength ((sensor sensor) (radiator radiator))
+  ;; Assume sensors are shielded from radiators on same platform
+  (if (eq (platform sensor) (platform radiator))
+    0.0
+    (let ((lp (location radiator))
+	  (sp (location sensor)))
+      (let ((sd (square-distance sp lp))
+	    (i (cos (angle (orientation sensor)
+			   (orientation-between sp lp)))))
+        (if (directional? sensor)
+	  (/  (* (+ i 1.0) (output radiator)) (* 2.0 sd))
+          (/ (output radiator) (* 2.0 sd)))))))
+
+
+(defmethod location ((self sensor))
+  (add-location (location (platform self))
+	        (relative-location self)))
+
+(defmethod orientation ((self sensor))
+  (add-orientation (orientation (platform self))
+		   (relative-orientation self)))
+
+;; --------------------
+;; Motor
+;; 
+;; A motor on a vehicle.
+;; --------------------
+
+(defclass motor (integrator)
+  ((location :accessor location :initform nil :initarg :location)))
+
+
+(defstruct color r g b)
+
+(defun rgb->color (r g b)
+  (make-color :r r :g g :b b))
+
+;;----------------------------------------
+;;
+;; Platforms
+;;
+;; Objects with a position and orientation in space.
+;;
+;;----------------------------------------
+
+(defclass platform (named-object)
+  ((location :accessor location :initarg :location :initform nil)
+   (orientation :accessor orientation :initarg :orientation :initform nil)
+   (old-location :accessor old-location :initform nil)
+   (depiction :accessor platform-depiction :initarg :depiction :initform nil)
+   (color :accessor color :initarg :color :initform (rgb->color 0 0 0))
+   (bindings :accessor bindings :initarg :bindings :initform nil)))
+
+
+(defmethod velocity ((self platform))
+  (if (old-location self)
+    (* (distance (location self) (old-location self))
+       (world-ticks-per-second (world self)))
+    0))
+
+(defmethod print-object ((self platform) stream)
+  (print-unreadable-object (self stream :type T :identity T)
+    (format stream "[(~,2F, ~,2F) ~,2F ~,2F units/s]"
+            (if (location self)
+              (2d-location-x (location self))
+              0)
+            (if (location self)
+              (2d-location-y (location self))
+              0)
+            (if (orientation self)
+              (2d-orientation-theta (orientation self))
+              0)
+            (velocity self))))
+
+(defmethod world-nodes ((self platform))
+  (lookup :brain (bindings self)))
+
+;; --------------------
+;; Two-wheeled Vehicle
+;; 
+;; A vehicle with two caster wheels in front and two motorized wheels in the
+;; rear.
+;; --------------------
+
+(defclass two-wheeled-vehicle (platform)
+  ((max-speed :accessor max-speed :initarg :max-speed :initform 10.0)
+   (wheel-radius :accessor wheel-radius :initarg :wheel-radius :initform 0.05)
+   (wheel-base :accessor wheel-base :initarg :wheel-base :initform 0.3)
+   (length :accessor vehicle-length :initarg :vehicle-length :initform 0.6)
+   (right-motor :accessor right-motor :initarg :right-motor :initform nil)
+   (left-motor :accessor left-motor :initarg :left-motor :initform nil)
+   (last-move-time :accessor last-move-time :initform nil)
+   (left-wheel-rotation-angle :accessor left-wheel-rotation-angle :initform 0.0)
+   (right-wheel-rotation-angle :accessor right-wheel-rotation-angle :initform 0.0)))
+   
+
+(defmethod print-object ((self two-wheeled-vehicle) stream)
+  (print-unreadable-object (self stream :type T :identity T)
+    (format stream "~S [(~,2F, ~,2F) ~,2F ~,2F units/s]"
+            (name-of self)
+            (if (location self)
+              (2d-location-x (location self))
+              0)
+            (if (location self)
+              (2d-location-y (location self))
+              0)
+            (if (orientation self)
+              (2d-orientation-theta (orientation self))
+              0)
+            (velocity self))))
+
+
+;; This is a surprisingly complicated function.
+;;
+;; 1. Compute the distance that each wheel moves.  This is based on
+;; the output of the motor driving the wheel.
+;;
+;; 2. These two distances are assumed to be the lengths of two arcs of
+;; concentric circles.  The difference in radii of the circles is the
+;; wheel base of the vehicle.
+;;
+;; 3. Knowing the lengths of the arcs and the difference in radii, we
+;; can calculate the radius of the turn and the change in heading.
+;; Now we can determine the change in location.
+
+(defmethod move ((self two-wheeled-vehicle))
+  ;; max-dist is the distance forward that the vehicle would move if
+  ;; it was going at maximum speed.
+  ;; x, y are the location of the vehicle.
+  ;; theta is the angle the vehicle is facing.
+  ;; wheel-base is the distance between the vehicle's two wheels.
+  (if (and (not (null (last-move-time self)))
+               (<= (world-time (world self)) (last-move-time self)))
+    NIL
+    (let* ((max-dist (/ (max-speed self) (world-ticks-per-second (world self))))
+	   (dist-right (* (output (right-motor self)) max-dist))
+	   (dist-left (* (output (left-motor self)) max-dist)))
+      (let ((location (location self))
+            (orientation (orientation self)))
+        (let ((theta (2d-orientation-theta orientation))
+              (x (2d-location-x location))
+              (y (2d-location-y location))
+	      (wheel-base (wheel-base self)))
+          (let ((old-loc (old-location self)))
+            (if (null old-loc)
+              (setf (old-location self) (make-2d-location :x x :y y))
+              (setf (2d-location-x old-loc) x
+                    (2d-location-y old-loc) y)))
+          (let ((dist-diff (- dist-right dist-left)))
+            (let* ((delta-theta (/ dist-diff wheel-base))
+                   (turn-radius (if (< (abs dist-diff) 0.0001)
+                                  0.0
+			          (- (/ dist-right delta-theta)
+				     (/ wheel-base 2))))
+                   (new-theta (+ theta delta-theta)))
+              (let ((new-x (if (= turn-radius 0.0)
+                             (+ x (* (cos theta) dist-left))
+                             (+ x (* (- (sin new-theta) (sin theta))
+				     turn-radius))))
+                    (new-y (if (= turn-radius 0.0)
+                             (+ y (* (sin theta) dist-left))
+                             (- y (* (- (cos new-theta) (cos theta))
+                                     turn-radius)))))
+                ;; destructive modification to minimize consing
+                (setf (2d-orientation-theta orientation) new-theta)
+                (setf (2d-location-x location) new-x)
+                (setf (2d-location-y location) new-y))))))
+      (setf (last-move-time self) (world-time (world self)))
+      T)))
+
+;; --------------------
+;; Lamp
+;; 
+;; A non-mobile platform.
+;; --------------------
+
+(defclass lamp (platform)
+  ()
+  (:default-initargs :color (rgb->color 0.9 0.9 1)))
+
+
+(defmethod print-object ((self lamp) stream)
+  (print-unreadable-object (self stream :type T :identity T)
+    (format stream "[(~,2F, ~,2F) Brightness: ~,2F]"
+            (if (location self)
+              (2d-location-x (location self))
+              0)
+            (if (location self)
+              (2d-location-y (location self))
+              0)
+            (if (world self)
+              (brightness self)
+              nil))))
+
+
+
+(defmethod brightness ((self lamp))
+  (let ((radiators (remove-if-not
+                    #'(lambda (r)
+                        (eq (platform r) self))
+                    (world-radiators (world self)))))
+    (sum-world-node-values #'output radiators)))
